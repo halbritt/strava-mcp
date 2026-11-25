@@ -100,9 +100,9 @@ def _parse_retry_after_header(raw: str | None, utc_now: datetime) -> int | None:
         return max(1, int(cleaned))
     try:
         parsed_dt = parsedate_to_datetime(cleaned)
-    except (TypeError, ValueError):
+        return retry_after_seconds(parsed_dt, utc_now)
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
-    return retry_after_seconds(parsed_dt, utc_now)
 
 
 def _extract_fault_message(response: httpx.Response) -> str | None:
@@ -375,7 +375,10 @@ class RateLimitTracker:
         header_retry = _parse_retry_after_header(response.headers.get("retry-after"), utc_now)
         if header_retry is not None:
             retry_sec = header_retry
-            reset_at = utc_now + timedelta(seconds=retry_sec)
+            try:
+                reset_at = utc_now + timedelta(seconds=retry_sec)
+            except OverflowError:
+                reset_at = datetime.max.replace(tzinfo=UTC)
         else:
             reset_at = reset_15m
             retry_sec = retry_after_seconds(reset_at, utc_now)

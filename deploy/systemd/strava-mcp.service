@@ -1,0 +1,23 @@
+[Unit]
+Description=strava-mcp: read-only Strava MCP server (127.0.0.1:8772)
+Documentation=file://%h/git/strava-mcp/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/git/strava-mcp
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/bin/strava-mcp serve --listen 127.0.0.1:8772
+Restart=on-failure
+RestartSec=5
+MemoryMax=512M
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/strava-mcp %h/.local/share/strava-mcp
+
+[Install]
+WantedBy=default.target

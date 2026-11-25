@@ -1,0 +1,21 @@
+#!/bin/sh
+# Claude Code MCP headersHelper for strava-mcp.
+# Reads the 0600 bearer token from ~/.config/strava-mcp/mcp-token (or
+# STRAVA_MCP_CONFIG_DIR / STRAVA_MCP_TOKEN_FILE) so no secret sits in client configs.
+set -eu
+
+config_dir="${STRAVA_MCP_CONFIG_DIR:-$HOME/.config/strava-mcp}"
+token_file="${STRAVA_MCP_TOKEN_FILE:-$config_dir/mcp-token}"
+
+if [ ! -r "$token_file" ]; then
+    echo "strava-mcp-headers: unreadable token file: $token_file" >&2
+    exit 1
+fi
+
+token=$(tr -d '\r\n' < "$token_file")
+if [ -z "$token" ]; then
+    echo "strava-mcp-headers: empty token file: $token_file" >&2
+    exit 1
+fi
+
+printf '{"Authorization": "Bearer %s"}\n' "$token"
