@@ -241,18 +241,30 @@ def load_config() -> Config:
 def ensure_secure_dir(path: Path | str) -> Path:
     """Create directory if needed and enforce 0700 permissions without following symlinks."""
     target = Path(path)
-    if target.is_symlink():
+    try:
+        st = target.lstat()
+    except FileNotFoundError:
+        st = None
+    except OSError as exc:
         raise ConfigError(
             "insecure_permissions",
-            f"Refusing symlinked directory: {target}",
-            details={"path": str(target)},
-        )
-    if target.exists() and not target.is_dir():
-        raise ConfigError(
-            "insecure_permissions",
-            f"Expected regular directory at {target}",
-            details={"path": str(target)},
-        )
+            f"Cannot access secure directory {target}: {exc.strerror or exc}",
+            details={"path": str(target), "error_type": type(exc).__name__},
+        ) from None
+
+    if st is not None:
+        if stat.S_ISLNK(st.st_mode):
+            raise ConfigError(
+                "insecure_permissions",
+                f"Refusing symlinked directory: {target}",
+                details={"path": str(target)},
+            )
+        if not stat.S_ISDIR(st.st_mode):
+            raise ConfigError(
+                "insecure_permissions",
+                f"Expected regular directory at {target}",
+                details={"path": str(target)},
+            )
     try:
         target.mkdir(parents=True, exist_ok=True, mode=0o700)
     except (FileExistsError, NotADirectoryError):
@@ -261,13 +273,26 @@ def ensure_secure_dir(path: Path | str) -> Path:
             f"Expected regular directory at {target}",
             details={"path": str(target)},
         ) from None
+    except OSError as exc:
+        raise ConfigError(
+            "insecure_permissions",
+            f"Failed to create secure directory {target}: {exc.strerror or exc}",
+            details={"path": str(target), "error_type": type(exc).__name__},
+        ) from None
     if target.is_symlink() or not target.is_dir():
         raise ConfigError(
             "insecure_permissions",
             f"Expected regular directory at {target}",
             details={"path": str(target)},
         )
-    os.chmod(target, 0o700)
+    try:
+        os.chmod(target, 0o700)
+    except OSError as exc:
+        raise ConfigError(
+            "insecure_permissions",
+            f"Failed to set permissions on secure directory {target}: {exc.strerror or exc}",
+            details={"path": str(target), "error_type": type(exc).__name__},
+        ) from None
     return target
 
 
@@ -277,22 +302,45 @@ def verify_secure_permissions(
     missing_error: type[StravaMCPError] = ConfigError,
     missing_code: str = "config_missing",
     missing_message: str | None = None,
+    expect_regular_file: bool = False,
 ) -> None:
-    """Verify path exists, is not a symlink, and has no group/other permissions."""
+    """Verify path exists, is not a symlink, is a regular file/dir, and has 0 group/other perms."""
     target = Path(path)
-    if target.is_symlink():
+    try:
+        st = target.lstat()
+    except FileNotFoundError:
+        raise missing_error(
+            missing_code,
+            missing_message or f"Required path does not exist: {target}",
+            details={"path": str(target)},
+        ) from None
+    except OSError as exc:
+        raise ConfigError(
+            "insecure_permissions",
+            f"Cannot inspect secure path {target}: {exc.strerror or exc}",
+            details={"path": str(target), "error_type": type(exc).__name__},
+        ) from None
+
+    if stat.S_ISLNK(st.st_mode):
         raise ConfigError(
             "insecure_permissions",
             f"Refusing symlink at secure path: {target}",
             details={"path": str(target)},
         )
-    if not target.exists():
-        raise missing_error(
-            missing_code,
-            missing_message or f"Required path does not exist: {target}",
+    if expect_regular_file:
+        if not stat.S_ISREG(st.st_mode):
+            raise ConfigError(
+                "insecure_permissions",
+                f"Expected regular file at secure path: {target}",
+                details={"path": str(target)},
+            )
+    elif not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+        raise ConfigError(
+            "insecure_permissions",
+            f"Refusing non-regular path at secure location: {target}",
             details={"path": str(target)},
         )
-    mode = stat.S_IMODE(target.lstat().st_mode)
+    mode = stat.S_IMODE(st.st_mode)
     if mode & 0o077 != 0:
         raise ConfigError(
             "insecure_permissions",
@@ -434,6 +482,7 @@ def load_client(config_or_dir: Config | Path | str) -> ClientConfig:
         missing_error=ConfigError,
         missing_code="config_missing",
         missing_message=f"Client configuration file not found: {path}. Run 'strava-mcp init'.",
+        expect_regular_file=True,
     )
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -474,6 +523,7 @@ def load_tokens(config_or_dir: Config | Path | str) -> TokenData:
         missing_message=(
             f"Tokens file not found: {path}. Run 'strava-mcp auth' or 'strava-mcp init'."
         ),
+        expect_regular_file=True,
     )
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -525,6 +575,7 @@ def load_mcp_token(config_or_dir: Config | Path | str) -> str:
         missing_error=ConfigError,
         missing_code="config_missing",
         missing_message=f"MCP bearer token file not found: {path}. Run 'strava-mcp init'.",
+        expect_regular_file=True,
     )
     try:
         token = path.read_text(encoding="utf-8").strip()

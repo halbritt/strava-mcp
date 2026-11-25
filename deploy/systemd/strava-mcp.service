@@ -17,7 +17,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/strava-mcp %h/.local/share/strava-mcp
+ReadWritePaths=%h/.config/strava-mcp -%h/.local/share/strava-mcp
 
 [Install]
 WantedBy=default.target

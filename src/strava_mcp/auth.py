@@ -170,10 +170,21 @@ async def _acquire_file_lock(
                 f"Refusing symlinked lock file: {lock_file}",
                 details={"path": str(lock_file)},
             ) from None
-        raise
+        raise ConfigError(
+            "insecure_permissions",
+            f"Cannot open token lock file {lock_file}: {exc.strerror or exc}",
+            details={"path": str(lock_file), "error_type": type(exc).__name__},
+        ) from None
     acquired = False
     try:
-        os.fchmod(fd, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError as exc:
+            raise ConfigError(
+                "insecure_permissions",
+                f"Cannot secure token lock file {lock_file}: {exc.strerror or exc}",
+                details={"path": str(lock_file), "error_type": type(exc).__name__},
+            ) from None
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
             try:
@@ -232,8 +243,19 @@ def _extract_athlete_id(payload: dict[str, Any]) -> int | None:
     athlete = payload.get("athlete")
     if isinstance(athlete, dict) and athlete.get("id") is not None:
         raw_id = athlete["id"]
-        if not isinstance(raw_id, bool):
+        if isinstance(raw_id, bool):
+            raise AuthError(
+                "refresh_failed",
+                "OAuth response contained invalid athlete.id.",
+            )
+        try:
             return int(raw_id)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise AuthError(
+                "refresh_failed",
+                "OAuth response contained invalid athlete.id.",
+                details={"error_type": type(exc).__name__},
+            ) from None
     return None
 
 
@@ -382,7 +404,7 @@ class TokenManager:
         if raw_expires_in is not None and not isinstance(raw_expires_in, bool):
             try:
                 expires_in = int(raw_expires_in)
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise AuthError(
                     "refresh_failed",
                     "OAuth response contained invalid expires_in.",
@@ -392,7 +414,7 @@ class TokenManager:
         if raw_expires_at is not None and not isinstance(raw_expires_at, bool):
             try:
                 expires_at = int(raw_expires_at)
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise AuthError(
                     "refresh_failed",
                     "OAuth response contained invalid expires_at.",

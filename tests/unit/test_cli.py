@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import stat
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -229,13 +230,20 @@ def test_cli_status_offline_live_and_redaction(
 ) -> None:
     cfg = _set_isolated_env(monkeypatch, tmp_path)
     rc_empty = cli.main(["status", "--json"])
-    assert rc_empty == 0
-    empty_status = json.loads(capsys.readouterr().out)
-    assert empty_status["client_configured"] is False
-    assert empty_status["authenticated"] is False
+    assert rc_empty == 1
+    captured_empty = capsys.readouterr()
+    assert captured_empty.out == ""
+    assert json.loads(captured_empty.err)["error"]["code"] == "config_missing"
     assert not cfg.cache_db_file.exists()
 
     save_client(cfg, ClientConfig(client_id="123456", client_secret="sec_status_secret"))
+    rc_client_only = cli.main(["status", "--json"])
+    assert rc_client_only == 0
+    client_only_status = json.loads(capsys.readouterr().out)
+    assert client_only_status["client_configured"] is True
+    assert client_only_status["authenticated"] is False
+    assert not cfg.cache_db_file.exists()
+
     save_tokens(
         cfg,
         TokenData(
@@ -664,3 +672,203 @@ def test_cli_out_of_range_token_timestamps(
     assert rc_human == 0
     captured_human = capsys.readouterr()
     assert "(out-of-range)" in captured_human.out
+
+
+def test_cli_init_non_tty_piped_stdin_without_flag_and_empty_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = _set_isolated_env(monkeypatch, tmp_path)
+
+    class _PipedStdin(io.StringIO):
+        def isatty(self) -> bool:
+            return False
+
+    monkeypatch.setattr(cli.sys, "stdin", _PipedStdin("   \n"))
+    rc_empty = cli.main(["init", "--client-id", "654321", "--json"])
+    assert rc_empty == 1
+    err_empty = capsys.readouterr().err
+    assert json.loads(err_empty)["error"]["code"] == "invalid_config"
+    assert not cfg.client_file.exists()
+
+    monkeypatch.setattr(cli.sys, "stdin", _PipedStdin("piped_client_secret_val\n"))
+    rc_ok = cli.main(["init", "--client-id", "654321"])
+    assert rc_ok == 0
+    captured = capsys.readouterr()
+    assert "654321" in captured.out
+    assert "piped_client_secret_val" not in captured.out
+    assert "piped_client_secret_val" not in captured.err
+    assert stat.S_IMODE(cfg.client_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(cfg.mcp_token_file.stat().st_mode) == 0o600
+
+
+def test_cli_status_human_readable_prints_rate_limits_and_resets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = _set_isolated_env(monkeypatch, tmp_path)
+    save_client(cfg, ClientConfig(client_id="123456", client_secret="sec_human_status"))
+    save_tokens(
+        cfg,
+        TokenData(
+            access_token="tok_human_access",
+            refresh_token="tok_human_refresh",
+            expires_at=int(datetime(2099, 1, 1, tzinfo=UTC).timestamp()),
+            scope="read,activity:read_all,profile:read_all",
+            athlete_id=77,
+        ),
+    )
+    write_secret_text(cfg.mcp_token_file, "tok_human_mcp\n")
+
+    def _live_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "X-RateLimit-Limit": "400,4000",
+                "X-RateLimit-Usage": "17,99",
+                "X-ReadRateLimit-Limit": "200,2000",
+                "X-ReadRateLimit-Usage": "13,43",
+            },
+            json={"id": 77, "username": "human_rider"},
+        )
+
+    orig_client = cli.StravaClient
+    monkeypatch.setattr(
+        cli,
+        "StravaClient",
+        lambda c: orig_client(c, transport=httpx.MockTransport(_live_handler)),
+    )
+
+    rc = cli.main(["status", "--check-live"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    out = captured.out
+    assert "Rate limit (read):" in out
+    assert "15m=13/200" in out
+    assert "daily=43/2000" in out
+    assert "Rate limit (overall):" in out
+    assert "15m=17/400" in out
+    assert "daily=99/4000" in out
+    assert "Rate resets (UTC):" in out
+    assert "Live check:" in out
+    for secret in ("sec_human_status", "tok_human_access", "tok_human_refresh", "tok_human_mcp"):
+        assert secret not in out
+        assert secret not in captured.err
+
+
+def test_cli_surfaces_sqlite_error_as_structured_cache_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_isolated_env(monkeypatch, tmp_path)
+
+    def _boom(*_args: Any, **_kwargs: Any) -> ResponseCache:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cli, "ResponseCache", _boom)
+
+    rc_json = cli.main(["cache", "stats", "--json"])
+    assert rc_json == 1
+    captured_json = capsys.readouterr()
+    assert captured_json.out == ""
+    err_payload = json.loads(captured_json.err)
+    assert err_payload["error"]["code"] == "cache_error"
+    assert "database is locked" in err_payload["error"]["message"]
+    assert "Traceback" not in captured_json.err
+
+    rc_human = cli.main(["cache", "clear"])
+    assert rc_human == 1
+    captured_human = capsys.readouterr()
+    assert "Error [cache_error]:" in captured_human.err
+    assert "Traceback" not in captured_human.err
+
+
+def test_cli_init_none_stdin_eof_bad_import_preserves_clean_dir_and_busy_port_stats_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import getpass
+    import socket
+
+    cfg = _set_isolated_env(monkeypatch, tmp_path)
+
+    # 1. sys.stdin is None on init with --client-id -> clean ConfigError, no partial client.json
+    monkeypatch.setattr(cli.sys, "stdin", None)
+    rc_none = cli.main(["init", "--client-id", "123456", "--json"])
+    assert rc_none == 1
+    err_none = json.loads(capsys.readouterr().err)
+    assert err_none["error"]["code"] == "invalid_config"
+    assert not cfg.client_file.exists()
+
+    # 2. Interactive EOFError -> clean ConfigError
+    class _FakeTTY:
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeTTY())
+    monkeypatch.setattr(getpass, "getpass", lambda _p="": (_ for _ in ()).throw(EOFError()))
+    rc_eof = cli.main(["init", "--client-id", "123456", "--json"])
+    assert rc_eof == 1
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "invalid_config"
+    assert not cfg.client_file.exists()
+
+    # 3. Bad --import-tokens-file must NOT write partial client.json
+    bad_import = tmp_path / "bad_import.json"
+    bad_import.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("secret_should_not_persist\n"))
+    rc_bad_import = cli.main(
+        [
+            "init",
+            "--client-id",
+            "123456",
+            "--client-secret-stdin",
+            "--import-tokens-file",
+            str(bad_import),
+            "--json",
+        ]
+    )
+    assert rc_bad_import == 1
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "invalid_config"
+    assert not cfg.client_file.exists()
+    assert not cfg.tokens_file.exists()
+    assert not cfg.mcp_token_file.exists()
+
+    # 4. stats --athlete-id 0 / -5 rejected cleanly before HTTP
+    save_client(cfg, ClientConfig(client_id="123456", client_secret="sec_stats_val"))
+    save_tokens(
+        cfg,
+        TokenData(
+            access_token="acc",
+            refresh_token="ref",
+            expires_at=int(datetime(2099, 1, 1, tzinfo=UTC).timestamp()),
+            scope="read",
+            athlete_id=42,
+        ),
+    )
+    for bad_aid in ("0", "-5"):
+        rc_aid = cli.main(["stats", "--athlete-id", bad_aid, "--json"])
+        assert rc_aid == 1
+        err_aid = json.loads(capsys.readouterr().err)
+        assert err_aid["error"]["code"] == "invalid_argument"
+
+    # 5. auth on busy port emits structured io_error without traceback
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        busy_port = sock.getsockname()[1]
+        rc_busy = cli.main(["auth", "--port", str(busy_port), "--no-browser", "--json"])
+        assert rc_busy == 1
+        err_busy_txt = capsys.readouterr().err
+        assert "Traceback" not in err_busy_txt
+        assert json.loads(err_busy_txt)["error"]["code"] == "io_error"
+
+    # 6. status detects dangling symlink at cache.sqlite
+    cfg.cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cfg.cache_db_file.symlink_to(tmp_path / "missing_cache.sqlite")
+    rc_sym = cli.main(["status", "--json"])
+    assert rc_sym == 1
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "insecure_permissions"

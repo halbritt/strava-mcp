@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from contextlib import asynccontextmanager, suppress
@@ -730,6 +731,53 @@ def test_headers_helper_script(tmp_path: Path) -> None:
     assert ok.returncode == 0
     assert json.loads(ok.stdout) == {"Authorization": "Bearer unit_mcp_bearer_val"}
 
+    # Insecure file permissions (0644) must fail without leaking token
+    os.chmod(cfg.mcp_token_file, 0o644)
+    bad_file_perm = subprocess.run(
+        [str(HEADERS_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert bad_file_perm.returncode == 1
+    assert bad_file_perm.stdout == ""
+    assert "insecure permissions (expected 0600)" in bad_file_perm.stderr
+    assert "unit_mcp_bearer_val" not in bad_file_perm.stderr
+    os.chmod(cfg.mcp_token_file, 0o600)
+
+    # Insecure directory permissions (0755) must fail without leaking token
+    os.chmod(cfg.config_dir, 0o755)
+    bad_dir_perm = subprocess.run(
+        [str(HEADERS_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert bad_dir_perm.returncode == 1
+    assert bad_dir_perm.stdout == ""
+    assert "insecure permissions" in bad_dir_perm.stderr
+    assert "unit_mcp_bearer_val" not in bad_dir_perm.stderr
+    os.chmod(cfg.config_dir, 0o700)
+
+    # Symlink token file must fail
+    sym_dir = tmp_path / "sym_cfg"
+    sym_dir.mkdir(mode=0o700)
+    (sym_dir / "mcp-token").symlink_to(cfg.mcp_token_file)
+    env_sym = dict(env)
+    env_sym["STRAVA_MCP_CONFIG_DIR"] = str(sym_dir)
+    sym_res = subprocess.run(
+        [str(HEADERS_SCRIPT)],
+        env=env_sym,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert sym_res.returncode == 1
+    assert sym_res.stdout == ""
+    assert "unit_mcp_bearer_val" not in sym_res.stderr
+
     empty_dir = tmp_path / "missing_cfg"
     empty_dir.mkdir()
     env["STRAVA_MCP_CONFIG_DIR"] = str(empty_dir)
@@ -852,3 +900,144 @@ async def test_mcp_auth_status_handles_out_of_range_expires_at(tmp_path: Path) -
         assert res.structured_content["expires_at"] == 99999999999999999999
         assert res.structured_content["expires_at_utc"] is None
         assert res.structured_content["is_expired"] is False
+
+
+async def test_mcp_resource_and_tool_surface_sqlite_error_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_config(tmp_path)
+    cfg.cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cfg.cache_db_file.write_bytes(b"")
+    os.chmod(cfg.cache_db_file, 0o600)
+
+    def _raise_sqlite(*_args: Any, **_kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("strava_mcp.mcp_server.ResponseCache", _raise_sqlite)
+    mcp, _state = create_mcp_server(cfg)
+
+    async with create_client_server_memory_streams() as (client_streams, server_streams):
+        server_read, server_write = server_streams
+        client_read, client_write = client_streams
+        init_opts = mcp._lowlevel_server.create_initialization_options()
+        server_task = asyncio.create_task(
+            mcp._lowlevel_server.run(server_read, server_write, init_opts)
+        )
+        try:
+            async with ClientSession(client_read, client_write) as session:
+                await session.initialize()
+                with pytest.raises(MCPError) as exc_info:
+                    await session.read_resource("strava://status/rate-limits")
+                err_msg = str(exc_info.value)
+                assert "cache_error" in err_msg
+                assert "Traceback" not in err_msg
+        finally:
+            server_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await server_task
+
+    async with _open_memory_session(cfg, _default_mock_handler) as session:
+        async def _broken_get_athlete(*_args: Any, **_kwargs: Any) -> Any:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(StravaClient, "get_athlete", _broken_get_athlete)
+        tool_res = await session.call_tool("strava_get_athlete", {})
+        assert tool_res.is_error is True
+        assert tool_res.structured_content is not None
+        assert tool_res.structured_content["error"]["code"] == "cache_error"
+        assert "database is locked" in tool_res.structured_content["error"]["message"]
+
+
+async def test_segment_efforts_limit_200_has_more_and_resource_sanitization_and_dangling_cache(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_config(tmp_path)
+
+    def _efforts_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/segment_efforts"):
+            return httpx.Response(
+                200,
+                json=[{"id": i, "elapsed_time": 100 + i} for i in range(1, 201)],
+            )
+        if request.url.path.endswith("/athlete"):
+            raise RuntimeError("boom unit_client_secret_val")
+        return _default_mock_handler(request)
+
+    async with _open_memory_session(cfg, _efforts_handler) as session:
+        res = await session.call_tool(
+            "strava_list_segment_efforts",
+            {"segment_id": 8001, "limit": 200},
+        )
+        assert res.is_error is False
+        assert res.structured_content is not None
+        assert res.structured_content["count"] == 200
+        assert res.structured_content["has_more"] is True
+
+        with pytest.raises(MCPError) as exc_res:
+            await session.read_resource("strava://athlete/profile")
+        assert "Unexpected internal error." in str(exc_res.value)
+        assert "unit_client_secret_val" not in str(exc_res.value)
+
+    # Dangling symlink at cache.sqlite must fail in auth_status and rate_limit_status_resource
+    cfg_sym = _make_config(tmp_path / "dangling_cache")
+    cfg_sym.cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (cfg_sym.cache_db_file).symlink_to(tmp_path / "does_not_exist.sqlite")
+    mcp_sym, _state = create_mcp_server(cfg_sym)
+    async with create_client_server_memory_streams() as (client_streams, server_streams):
+        server_read, server_write = server_streams
+        client_read, client_write = client_streams
+        init_opts = mcp_sym._lowlevel_server.create_initialization_options()
+        server_task = asyncio.create_task(
+            mcp_sym._lowlevel_server.run(server_read, server_write, init_opts)
+        )
+        try:
+            async with ClientSession(client_read, client_write) as session:
+                await session.initialize()
+                auth_res = await session.call_tool("strava_auth_status", {})
+                assert auth_res.is_error is True
+                assert auth_res.structured_content is not None
+                assert auth_res.structured_content["error"]["code"] == "insecure_permissions"
+
+                with pytest.raises(MCPError) as exc_rl:
+                    await session.read_resource("strava://status/rate-limits")
+                assert "insecure_permissions" in str(exc_rl.value)
+        finally:
+            server_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await server_task
+
+
+def test_headers_helper_trims_whitespace_and_rejects_bad_tokens(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path, seed_secrets=False)
+    cfg.config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("STRAVA_")}
+    env["STRAVA_MCP_CONFIG_DIR"] = str(cfg.config_dir)
+
+    # Valid token with surrounding ASCII whitespace trims cleanly
+    cfg.mcp_token_file.write_text("  valid_bearer-tok_123 \t\r\n", encoding="utf-8")
+    os.chmod(cfg.mcp_token_file, 0o600)
+    ok_res = subprocess.run(
+        [str(HEADERS_SCRIPT)], env=env, text=True, capture_output=True, check=False
+    )
+    assert ok_res.returncode == 0
+    assert json.loads(ok_res.stdout) == {"Authorization": "Bearer valid_bearer-tok_123"}
+
+    bad_tokens: list[bytes] = [
+        b"   \n",
+        b"\t\r\n",
+        b"tok1\ntok2\n",
+        b"tok with space\n",
+        b'tok"with\\chars\n',
+        b"tok\x00nul\n",
+    ]
+    for raw_bytes in bad_tokens:
+        cfg.mcp_token_file.write_bytes(raw_bytes)
+        os.chmod(cfg.mcp_token_file, 0o600)
+        bad_res = subprocess.run(
+            [str(HEADERS_SCRIPT)], env=env, capture_output=True, check=False
+        )
+        assert bad_res.returncode != 0, (
+            f"Expected failure for {raw_bytes!r}, got {bad_res.stdout!r}"
+        )
+        assert bad_res.stdout == b""

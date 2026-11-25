@@ -6,6 +6,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -341,3 +342,55 @@ def test_ensure_secure_dir_rejects_regular_file_and_coerces_str(tmp_path: Path) 
     mcp_tok = ensure_mcp_token(str_dir)
     assert load_mcp_token(str_dir) == mcp_tok
     assert delete_tokens(str_dir) is True
+
+
+def test_ensure_secure_dir_and_verify_permissions_handle_oserror_and_fifo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ro_parent = tmp_path / "ro_parent"
+    ro_parent.mkdir(mode=0o700)
+    os.chmod(ro_parent, 0o500)
+    try:
+        with pytest.raises(ConfigError) as exc_parent:
+            ensure_secure_dir(ro_parent / "child")
+        assert exc_parent.value.code == "insecure_permissions"
+    finally:
+        os.chmod(ro_parent, 0o700)
+
+    unchmoddable = tmp_path / "unchmoddable"
+    unchmoddable.mkdir(mode=0o500)
+    orig_chmod = os.chmod
+
+    def _fail_chmod(target: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+        if Path(target) == unchmoddable:
+            raise PermissionError(1, "Operation not permitted")
+        orig_chmod(target, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", _fail_chmod)
+    try:
+        with pytest.raises(ConfigError) as exc_chmod:
+            ensure_secure_dir(unchmoddable)
+        assert exc_chmod.value.code == "insecure_permissions"
+    finally:
+        monkeypatch.setattr(os, "chmod", orig_chmod)
+        os.chmod(unchmoddable, 0o700)
+
+    cfg_dir = tmp_path / "fifo_cfg"
+    ensure_secure_dir(cfg_dir)
+    for fname in ("client.json", "tokens.json", "mcp-token"):
+        fifo_path = cfg_dir / fname
+        os.mkfifo(fifo_path, 0o600)
+        os.chmod(fifo_path, 0o600)
+
+    with pytest.raises(ConfigError) as exc_client_fifo:
+        load_client(cfg_dir)
+    assert exc_client_fifo.value.code == "insecure_permissions"
+
+    with pytest.raises(ConfigError) as exc_tok_fifo:
+        load_tokens(cfg_dir)
+    assert exc_tok_fifo.value.code == "insecure_permissions"
+
+    with pytest.raises(ConfigError) as exc_mcp_fifo:
+        load_mcp_token(cfg_dir)
+    assert exc_mcp_fifo.value.code == "insecure_permissions"

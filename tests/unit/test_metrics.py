@@ -341,6 +341,8 @@ def test_summarize_metrics_groupings_and_visibility() -> None:
     assert weekly["activity_count"] == 2
     assert weekly["totals"]["private_count"] == 2
     assert weekly["totals"]["distance_km"] == 50.0
+    assert weekly["totals"]["elevation_gain"] == 800.0
+    assert weekly["totals"]["elevation_gain_m"] == 800.0
     # Time-weighted HR: (150*3600 + 165*1800) / 5400 = 155.0
     assert weekly["totals"]["avg_heartrate"] == 155.0
     assert weekly["totals"]["max_heartrate"] == 182.0
@@ -379,22 +381,74 @@ async def test_validate_gear_id_normalizers_and_pagination(tmp_path: Any) -> Non
             "clubs": [{"id": 9, "name": "Club", "sport_type": "cycling"}],
         }
     )
+    assert ath["weight"] == 70.0
+    assert ath["weight_kg"] == 70.0
     assert ath["weight_lbs"] == 154.3
     assert ath["bikes"][0]["distance_km"] == 2000.0
+    assert normalize_athlete({"id": 8})["weight"] is None
 
     stats = normalize_athlete_stats(
-        {"biggest_ride_distance": 100000.0, "recent_run_totals": {"count": 4, "distance": 40000.0}}
+        {
+            "biggest_ride_distance": 100000.0,
+            "recent_run_totals": {
+                "count": 4,
+                "distance": 40000.0,
+                "moving_time": 12000,
+                "elapsed_time": 12500,
+                "elevation_gain": 320.0,
+            },
+        }
     )
     assert stats["biggest_ride_distance_km"] == 100.0
+    assert stats["recent_run_totals"]["distance"] == 40000.0
     assert stats["recent_run_totals"]["distance_km"] == 40.0
+    assert stats["recent_run_totals"]["moving_time"] == 12000
+    assert stats["recent_run_totals"]["elapsed_time"] == 12500
+    assert stats["recent_run_totals"]["elevation_gain"] == 320.0
 
-    lap_norm = normalize_lap({"id": 1, "distance": 1000.0, "moving_time": 250})
+    lap_norm = normalize_lap(
+        {
+            "id": 1,
+            "distance": 1000.0,
+            "moving_time": 250,
+            "elapsed_time": 260,
+            "total_elevation_gain": 35.0,
+        }
+    )
     assert lap_norm["pace_min_per_km"] == "4:10"
+    assert lap_norm["distance"] == 1000.0
+    assert lap_norm["distance_m"] == 1000.0
+    assert lap_norm["moving_time"] == 250
+    assert lap_norm["moving_time_seconds"] == 250
+    assert lap_norm["elapsed_time"] == 260
+    assert lap_norm["total_elevation_gain"] == 35.0
     assert normalize_gear({"id": "b1", "distance": 16093.44})["distance_mi"] == 10.0
     route_norm = normalize_route({"id": 1, "distance": 10000.0, "elevation_gain": 200.0})
     assert route_norm["distance_km"] == 10.0
-    seg_norm = normalize_segment({"id": 2, "distance": 1000.0, "total_elevation_gain": 50.0})
-    assert seg_norm["distance_km"] == 1.0
+    seg_norm = normalize_segment(
+        {
+            "id": 2,
+            "distance": 4200.0,
+            "total_elevation_gain": 269.0,
+            "athlete_pr_effort": {"id": 91},
+            "athlete_segment_stats": {
+                "pr_elapsed_time": 980,
+                "pr_date": "2026-09-14",
+                "effort_count": 8,
+            },
+        }
+    )
+    assert seg_norm["distance"] == 4200.0
+    assert seg_norm["distance_m"] == 4200.0
+    assert seg_norm["distance_km"] == 4.2
+    assert seg_norm["total_elevation_gain"] == 269.0
+    assert seg_norm["total_elevation_gain_m"] == 269.0
+    assert seg_norm["athlete_pr_effort"] == {"id": 91}
+    assert seg_norm["athlete_segment_stats"] == {
+        "pr_elapsed_time": 980,
+        "pr_date": "2026-09-14",
+        "effort_count": 8,
+    }
 
     # Test pagination helper with StravaClient
     cfg = Config(
@@ -435,3 +489,77 @@ async def test_validate_gear_id_normalizers_and_pagination(tmp_path: Any) -> Non
         assert [a["id"] for a in items] == [1]
         assert pages_fetched == 1
         assert has_more is True
+
+    # Explicit per_page is honored across multi-page fetching when sport_type is unset
+    seen_queries: list[tuple[str, str]] = []
+    multipage_data = {
+        1: [{"id": 101}, {"id": 102}],
+        2: [{"id": 103}, {"id": 104}],
+        3: [{"id": 105}, {"id": 106}],
+    }
+
+    def _multipage_handler(request: httpx.Request) -> httpx.Response:
+        page = request.url.params.get("page", "1")
+        per_page_val = request.url.params.get("per_page", "30")
+        seen_queries.append((page, per_page_val))
+        return httpx.Response(200, json=multipage_data.get(int(page), []))
+
+    async with StravaClient(cfg, transport=httpx.MockTransport(_multipage_handler)) as client_mp:
+        items_mp, pages_mp, has_more_mp = await fetch_activities_paginated(
+            client_mp, per_page=2, limit=5, max_pages=5, refresh=True
+        )
+        assert [a["id"] for a in items_mp] == [101, 102, 103, 104, 105]
+        assert pages_mp == 3
+        assert has_more_mp is True
+        assert seen_queries == [("1", "2"), ("2", "2"), ("3", "2")]
+
+        # page > 1 + sport_type + limit starts from requested page and fetches 200/page
+        seen_sport_queries: list[tuple[str, str]] = []
+        page2_data = {
+            2: [
+                {"id": 201, "sport_type": "Run", "type": "Run"},
+                {"id": 202, "sport_type": "GravelRide", "type": "Ride"},
+            ],
+            3: [
+                {"id": 203, "sport_type": "GravelRide", "type": "Ride"},
+                {"id": 204, "sport_type": "GravelRide", "type": "Ride"},
+            ],
+        }
+
+        def _sport_page2_handler(request: httpx.Request) -> httpx.Response:
+            pg = request.url.params.get("page", "1")
+            pp = request.url.params.get("per_page", "30")
+            seen_sport_queries.append((pg, pp))
+            return httpx.Response(200, json=page2_data.get(int(pg), []))
+
+        async with StravaClient(
+            cfg, transport=httpx.MockTransport(_sport_page2_handler)
+        ) as client_sp:
+            items_sp, pages_sp, has_more_sp = await fetch_activities_paginated(
+                client_sp, sport_type="GravelRide", page=2, per_page=10, limit=2, refresh=True
+            )
+            assert [a["id"] for a in items_sp] == [202]
+            assert pages_sp == 1
+            assert has_more_sp is False
+            assert seen_sport_queries == [("2", "200")]
+
+
+def test_elevation_and_weight_rounding_consistency_across_normalizers() -> None:
+    for elev in (10.04, 15.34, 100.04, 269.04, 920.04):
+        act_ft = normalize_activity_units({"total_elevation_gain": elev})["elevation_gain_ft"]
+        stat_ft = normalize_athlete_stats({"recent_run_totals": {"elevation_gain": elev}})[
+            "recent_run_totals"
+        ]["elevation_gain_ft"]
+        route_ft = normalize_route({"id": 1, "elevation_gain": elev})["elevation_gain_ft"]
+        seg_ft = normalize_segment({"id": 2, "total_elevation_gain": elev})[
+            "total_elevation_gain_ft"
+        ]
+        agg_ft = summarize_metrics(
+            [{"id": 1, "sport_type": "Ride", "total_elevation_gain": elev}],
+            group_by="total",
+        )["totals"]["elevation_gain_ft"]
+        assert act_ft == stat_ft == route_ft == seg_ft == agg_ft
+
+    ath = normalize_athlete({"id": 1, "weight": 70.04})
+    assert ath["weight_kg"] == 70.0
+    assert ath["weight_lbs"] == normalize_athlete({"id": 1, "weight": 70.0})["weight_lbs"]

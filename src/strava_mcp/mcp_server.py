@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import sqlite3
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -199,6 +200,13 @@ async def _run_tool(
         return _ok_result(payload)
     except StravaMCPError as exc:
         return _error_result(exc.code, exc.message, exc.details, secrets=state.secrets())
+    except sqlite3.Error as exc:
+        return _error_result(
+            "cache_error",
+            f"SQLite cache error: {exc}",
+            {},
+            secrets=state.secrets(),
+        )
     except ValueError as exc:
         return _error_result("invalid_argument", str(exc), {}, secrets=state.secrets())
     except Exception:
@@ -217,8 +225,14 @@ async def _read_resource_json(
     except StravaMCPError as exc:
         safe = _redact_text(exc.message, state.secrets())
         raise ResourceError(f"[{exc.code}] {safe}") from None
+    except sqlite3.Error as exc:
+        safe = _redact_text(str(exc), state.secrets())
+        raise ResourceError(f"[cache_error] SQLite cache error: {safe}") from None
     except ValueError as exc:
         raise ResourceError(_redact_text(str(exc), state.secrets())) from None
+    except Exception:
+        logger.exception("Unexpected error reading MCP resource")
+        raise ResourceError("Unexpected internal error.") from None
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
@@ -234,7 +248,7 @@ async def _paginate_simple_list(
         batch = await fetch_page(page, per_page)
         return (batch, len(batch) >= per_page)
 
-    fetch_per_page = min(200, max(per_page, limit))
+    fetch_per_page = per_page
     collected: list[dict[str, Any]] = []
     pages_fetched = 0
     exhausted = False
@@ -308,7 +322,7 @@ def _auth_status_sync(state: ServerState) -> dict[str, Any]:
         cache_stats = state.client.cache.stats()
     else:
         rate_limits = RateLimitTracker().snapshot()
-        if cfg.cache_db_file.exists():
+        if cfg.cache_db_file.exists() or cfg.cache_db_file.is_symlink():
             with ResponseCache(cfg) as cache:
                 cache_stats = cache.stats()
         else:
@@ -823,7 +837,12 @@ def _register_tools(mcp: MCPServer, state: ServerState) -> None:
                 "count": len(sliced),
                 "efforts": sliced,
                 "has_more": (
-                    len(efforts) > limit if limit is not None else len(efforts) >= fetch_per_page
+                    (
+                        len(efforts) > limit
+                        or (limit >= fetch_per_page and len(efforts) >= fetch_per_page)
+                    )
+                    if limit is not None
+                    else len(efforts) >= fetch_per_page
                 ),
             }
 
@@ -918,7 +937,7 @@ def _register_resources(mcp: MCPServer, state: ServerState) -> None:
                     "cache": state.client.cache.stats(),
                 }
             cfg = state.config
-            if cfg.cache_db_file.exists():
+            if cfg.cache_db_file.exists() or cfg.cache_db_file.is_symlink():
                 with ResponseCache(cfg) as cache:
                     cache_stats = cache.stats()
             else:

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import getpass
 import json
+import sqlite3
 import sys
 import time
 import webbrowser
@@ -94,38 +95,52 @@ def _handle_init(args: argparse.Namespace) -> int:
     cfg = load_config()
     ensure_secure_dir(cfg.config_dir)
 
+    stdin_is_tty = sys.stdin is not None and sys.stdin.isatty()
     client_cfg: ClientConfig
+    should_save_client = False
     if args.client_id is not None:
-        if args.client_secret_stdin:
+        if args.client_secret_stdin or not stdin_is_tty:
+            if sys.stdin is None:
+                raise ConfigError(
+                    "invalid_config",
+                    "Cannot read client secret when stdin is unavailable.",
+                )
             secret = sys.stdin.read().strip()
-        elif sys.stdin.isatty():
-            secret = getpass.getpass("Strava Client Secret: ").strip()
         else:
-            raise ConfigError(
-                "invalid_config",
-                "Use --client-secret-stdin when supplying --client-id non-interactively.",
-            )
+            try:
+                secret = getpass.getpass("Strava Client Secret: ").strip()
+            except EOFError:
+                raise ConfigError(
+                    "invalid_config",
+                    "Aborted reading client credentials from stdin.",
+                ) from None
         if not secret:
             raise ConfigError("invalid_config", "client_secret must not be empty.")
         try:
             client_cfg = ClientConfig(client_id=args.client_id, client_secret=secret)
         except ValidationError:
             raise ConfigError("invalid_config", "Invalid client_id or client_secret.") from None
-        save_client(cfg, client_cfg)
+        should_save_client = True
     elif cfg.client_file.exists() or cfg.client_file.is_symlink():
         client_cfg = load_client(cfg)
-    elif sys.stdin.isatty():
-        entered_id = input("Strava Client ID: ").strip()
-        entered_secret = getpass.getpass("Strava Client Secret: ").strip()
+    elif stdin_is_tty:
+        try:
+            entered_id = input("Strava Client ID: ").strip()
+            entered_secret = getpass.getpass("Strava Client Secret: ").strip()
+        except EOFError:
+            raise ConfigError(
+                "invalid_config",
+                "Aborted reading client credentials from stdin.",
+            ) from None
         try:
             client_cfg = ClientConfig(client_id=entered_id, client_secret=entered_secret)
         except ValidationError:
             raise ConfigError("invalid_config", "Invalid client_id or client_secret.") from None
-        save_client(cfg, client_cfg)
+        should_save_client = True
     else:
         raise ConfigError("config_missing", "Missing --client-id for non-interactive init.")
 
-    tokens_imported = False
+    imported_tokens: TokenData | None = None
     if args.import_tokens_file is not None:
         src = Path(args.import_tokens_file)
         if src.is_symlink() or not src.is_file():
@@ -164,17 +179,23 @@ def _handle_init(args: argparse.Namespace) -> int:
                 if isinstance(raw_exp_in, bool):
                     raise ValueError("expires_in must be an integer, not a boolean.")
                 normalized["expires_at"] = int(time.time()) + int(raw_exp_in)
-            tokens = TokenData.model_validate(normalized)
-            datetime.fromtimestamp(tokens.expires_at, tz=UTC)
-            if tokens.updated_at is not None:
-                datetime.fromtimestamp(tokens.updated_at, tz=UTC)
+            imported_tokens = TokenData.model_validate(normalized)
+            datetime.fromtimestamp(imported_tokens.expires_at, tz=UTC)
+            if imported_tokens.updated_at is not None:
+                datetime.fromtimestamp(imported_tokens.updated_at, tz=UTC)
         except (ValidationError, ValueError, TypeError, OverflowError, OSError) as exc:
             raise ConfigError(
                 "invalid_config",
                 "Invalid token import payload.",
                 details={"path": str(src), "error_type": type(exc).__name__},
             ) from None
-        save_tokens(cfg, tokens)
+
+    if should_save_client:
+        save_client(cfg, client_cfg)
+
+    tokens_imported = False
+    if imported_tokens is not None:
+        save_tokens(cfg, imported_tokens)
         tokens_imported = True
 
     ensure_mcp_token(cfg)
@@ -243,12 +264,9 @@ async def _handle_auth(args: argparse.Namespace) -> int:
 async def _handle_status(args: argparse.Namespace) -> int:
     cfg = load_config()
 
-    client_configured = False
-    client_id: str | None = None
-    if cfg.client_file.exists() or cfg.client_file.is_symlink():
-        client_cfg = load_client(cfg)
-        client_configured = True
-        client_id = client_cfg.client_id
+    client_cfg = load_client(cfg)
+    client_configured = True
+    client_id: str | None = client_cfg.client_id
 
     mcp_token_configured = False
     if cfg.mcp_token_file.exists() or cfg.mcp_token_file.is_symlink():
@@ -286,7 +304,7 @@ async def _handle_status(args: argparse.Namespace) -> int:
             cache_stats = client.cache.stats()
     else:
         rate_limits = RateLimitTracker().snapshot()
-        if cfg.cache_db_file.exists():
+        if cfg.cache_db_file.exists() or cfg.cache_db_file.is_symlink():
             with ResponseCache(cfg) as cache:
                 cache_stats = cache.stats()
         else:
@@ -329,6 +347,26 @@ async def _handle_status(args: argparse.Namespace) -> int:
             if missing_rec:
                 print(f"Missing scope: {','.join(missing_rec)} (run 'strava-mcp auth')")
         print(f"Cache entries: {cache_stats.get('entry_count', 0)}")
+        read_rl = rate_limits.get("read", {})
+        overall_rl = rate_limits.get("overall", {})
+        resets_rl = rate_limits.get("resets", {})
+        print(
+            f"Rate limit (read):    "
+            f"15m={read_rl.get('usage_15m', 0)}/{read_rl.get('limit_15m', 200)}, "
+            f"daily={read_rl.get('usage_daily', 0)}/{read_rl.get('limit_daily', 2000)} "
+            f"(observed={read_rl.get('observed', False)})"
+        )
+        print(
+            f"Rate limit (overall): "
+            f"15m={overall_rl.get('usage_15m', 0)}/{overall_rl.get('limit_15m', 400)}, "
+            f"daily={overall_rl.get('usage_daily', 0)}/{overall_rl.get('limit_daily', 4000)} "
+            f"(observed={overall_rl.get('observed', False)})"
+        )
+        print(
+            f"Rate resets (UTC):    "
+            f"15m={resets_rl.get('fifteen_min_reset_at_utc')}, "
+            f"daily={resets_rl.get('daily_reset_at_utc')}"
+        )
         if live_check is not None:
             print(f"Live check:    OK (athlete_id={live_check['athlete_id']})")
     return 0
@@ -493,6 +531,8 @@ async def _handle_activity(args: argparse.Namespace) -> int:
 
 
 async def _handle_stats(args: argparse.Namespace) -> int:
+    if args.athlete_id is not None and args.athlete_id < 1:
+        raise ValueError("athlete_id must be >= 1.")
     cfg = load_config()
     async with StravaClient(cfg) as client:
         raw = await client.get_athlete_stats(athlete_id=args.athlete_id, refresh=args.refresh)
@@ -675,8 +715,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(f"Unknown command: {cmd}")
     except StravaMCPError as exc:
         return _emit_cli_error(exc.code, exc.message, exc.details, as_json=as_json)
+    except sqlite3.Error as exc:
+        return _emit_cli_error("cache_error", f"SQLite cache error: {exc}", {}, as_json=as_json)
     except (ValueError, OverflowError) as exc:
         return _emit_cli_error("invalid_argument", str(exc), {}, as_json=as_json)
+    except OSError as exc:
+        return _emit_cli_error(
+            "io_error",
+            str(exc) or type(exc).__name__,
+            {"error_type": type(exc).__name__, "errno": exc.errno},
+            as_json=as_json,
+        )
 
 
 if __name__ == "__main__":

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
 import sqlite3
 import stat
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -212,3 +216,300 @@ def test_cache_concurrent_multi_instance_and_close_semantics(tmp_path: Path) -> 
             c2.get("   ")
         finally:
             c2.close()
+
+
+def test_cache_recovers_cleanly_from_corrupt_sqlite_file(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cache_dir = tmp_path / "corrupt_cache"
+    cache_dir.mkdir(mode=0o700)
+    db_file = cache_dir / "cache.sqlite"
+    db_file.write_bytes(b"not-a-valid-sqlite-db")
+    os.chmod(db_file, 0o600)
+    wal_file = Path(f"{db_file}-wal")
+    wal_file.write_bytes(b"corrupt-wal")
+    os.chmod(wal_file, 0o600)
+
+    with caplog.at_level("WARNING", logger="strava_mcp.cache"):
+        with ResponseCache(cache_dir) as cache:
+            assert stat.S_IMODE(cache.db_path.stat().st_mode) == 0o600
+            assert cache.stats()["entry_count"] == 0
+            cache.set("k_recovered", {"ok": True}, ttl_seconds=60.0)
+            assert cache.get("k_recovered") == {"ok": True}
+            assert cache.clear() == 1
+
+    assert any("Corrupt SQLite cache" in rec.message for rec in caplog.records)
+    assert all(rec.exc_info is None for rec in caplog.records)
+
+
+def _mp_cold_start_worker(
+    cache_dir_str: str,
+    idx: int,
+    barrier: Any,
+    queue: Any,
+) -> None:
+    try:
+        barrier.wait(timeout=15.0)
+        with ResponseCache(Path(cache_dir_str)) as cache:
+            key = f"cold-{idx}"
+            cache.set(key, {"idx": idx}, ttl_seconds=60.0)
+            val = cache.get(key)
+            if val != {"idx": idx}:
+                queue.put(("err", idx, "AssertionError", f"unexpected value {val!r}"))
+                return
+        queue.put(("ok", idx))
+    except Exception as exc:
+        queue.put(("err", idx, type(exc).__name__, str(exc)))
+
+
+def _mp_corrupt_recovery_worker(
+    cache_dir_str: str,
+    idx: int,
+    barrier: Any,
+    queue: Any,
+) -> None:
+    try:
+        barrier.wait(timeout=15.0)
+        with ResponseCache(Path(cache_dir_str)) as cache:
+            key = f"k-{idx}"
+            cache.set(key, {"idx": idx}, ttl_seconds=60.0)
+            val = cache.get(key)
+            if val != {"idx": idx}:
+                queue.put(("err", idx, "AssertionError", f"unexpected value {val!r}"))
+                return
+        queue.put(("ok", idx))
+    except Exception as exc:
+        queue.put(("err", idx, type(exc).__name__, str(exc)))
+
+
+def test_cache_concurrent_cold_start_multiprocess(tmp_path: Path) -> None:
+    ctx = mp.get_context("spawn")
+    trials = 10
+    n_procs = 6
+    for trial in range(trials):
+        cache_dir = tmp_path / f"cold_trial_{trial}"
+        barrier = ctx.Barrier(n_procs)
+        queue = ctx.Queue()
+        procs = [
+            ctx.Process(
+                target=_mp_cold_start_worker,
+                args=(str(cache_dir), idx, barrier, queue),
+            )
+            for idx in range(n_procs)
+        ]
+        for proc in procs:
+            proc.start()
+        for proc in procs:
+            proc.join(timeout=20.0)
+            assert proc.exitcode == 0, f"trial={trial} worker exited with {proc.exitcode}"
+
+        results = [queue.get(timeout=5.0) for _ in range(n_procs)]
+        errors = [res for res in results if res[0] != "ok"]
+        assert errors == [], f"trial={trial} cold-start errors: {errors}"
+
+        lock_file = cache_dir / "cache.lock"
+        db_file = cache_dir / "cache.sqlite"
+        assert lock_file.exists()
+        assert stat.S_IMODE(lock_file.stat().st_mode) == 0o600
+        assert db_file.exists()
+        assert stat.S_IMODE(db_file.stat().st_mode) == 0o600
+        with ResponseCache(cache_dir) as check_cache:
+            assert check_cache.stats()["entry_count"] == n_procs
+
+
+def test_cache_concurrent_corrupt_recovery_multiprocess(tmp_path: Path) -> None:
+    ctx = mp.get_context("spawn")
+    n_procs = 4
+    for trial in range(3):
+        cache_dir = tmp_path / f"corrupt_trial_{trial}"
+        cache_dir.mkdir(mode=0o700)
+        db_file = cache_dir / "cache.sqlite"
+        db_file.write_bytes(b"not-a-valid-sqlite-db")
+        os.chmod(db_file, 0o600)
+        wal_file = Path(f"{db_file}-wal")
+        wal_file.write_bytes(b"corrupt-wal")
+        os.chmod(wal_file, 0o600)
+
+        barrier = ctx.Barrier(n_procs)
+        queue = ctx.Queue()
+        procs = [
+            ctx.Process(
+                target=_mp_corrupt_recovery_worker,
+                args=(str(cache_dir), idx, barrier, queue),
+            )
+            for idx in range(n_procs)
+        ]
+        for proc in procs:
+            proc.start()
+        for proc in procs:
+            proc.join(timeout=20.0)
+            assert proc.exitcode == 0, f"trial={trial} worker exited with {proc.exitcode}"
+
+        results = [queue.get(timeout=5.0) for _ in range(n_procs)]
+        errors = [res for res in results if res[0] != "ok"]
+        assert errors == [], f"trial={trial} corrupt-recovery errors: {errors}"
+        assert stat.S_IMODE(db_file.stat().st_mode) == 0o600
+        with ResponseCache(cache_dir) as check_cache:
+            assert check_cache.stats()["entry_count"] == n_procs
+
+
+def test_cache_clear_does_not_starve_writers_with_active_reader(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "clear_starve"
+    cache1 = ResponseCache(cache_dir, busy_timeout_seconds=5.0)
+    cache2 = ResponseCache(cache_dir, busy_timeout_seconds=0.3)
+    reader = sqlite3.connect(cache1.db_path, isolation_level=None)
+    try:
+        cache1.set("seed", {"v": 1}, ttl_seconds=60.0)
+        reader.execute("BEGIN")
+        assert reader.execute("SELECT COUNT(*) FROM cache_entries").fetchone()[0] == 1
+
+        errors: list[BaseException] = []
+        ready = threading.Barrier(2)
+
+        def _clear_worker() -> None:
+            try:
+                ready.wait(timeout=5.0)
+                cache1.clear()
+            except BaseException as exc:
+                errors.append(exc)
+
+        def _write_worker() -> None:
+            try:
+                ready.wait(timeout=5.0)
+                time.sleep(0.02)
+                cache2.set("after_clear", {"v": 2}, ttl_seconds=60.0)
+            except BaseException as exc:
+                errors.append(exc)
+
+        t0 = time.monotonic()
+        t_clear = threading.Thread(target=_clear_worker)
+        t_write = threading.Thread(target=_write_worker)
+        t_clear.start()
+        t_write.start()
+        t_clear.join(timeout=5.0)
+        t_write.join(timeout=5.0)
+        elapsed = time.monotonic() - t0
+
+        assert errors == []
+        assert elapsed < 1.5, f"clear() stalled concurrent writer for {elapsed:.2f}s"
+        assert cache1._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    finally:
+        reader.execute("ROLLBACK")
+        reader.close()
+        cache2.close()
+        cache1.close()
+
+
+def test_cache_rejects_symlinked_lock_file(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "sym_lock_cache"
+    cache_dir.mkdir(mode=0o700)
+    target = tmp_path / "outside.lock"
+    target.write_text("", encoding="utf-8")
+    (cache_dir / "cache.lock").symlink_to(target)
+
+    with pytest.raises(ConfigError) as exc_info:
+        ResponseCache(cache_dir)
+    assert exc_info.value.code == "insecure_permissions"
+
+
+def test_cache_stats_handles_vanishing_wal_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "vanish_wal"
+    with ResponseCache(cache_dir) as cache:
+        cache.set("k1", {"v": 1}, ttl_seconds=60.0)
+        wal_path = Path(f"{cache.db_path}-wal")
+        orig_stat = Path.stat
+
+        def _vanishing_wal_stat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+            if self == wal_path:
+                raise FileNotFoundError(str(self))
+            return orig_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", _vanishing_wal_stat)
+        st = cache.stats()
+        assert st["wal_size_bytes"] == 0
+        assert st["db_size_bytes"] > 0
+
+
+def test_cache_rejects_symlinked_journal_and_non_writable_parent(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "sym_journal_cache"
+    cache_dir.mkdir(mode=0o700)
+    outside = tmp_path / "outside.journal"
+    outside.write_text("keep", encoding="utf-8")
+    (cache_dir / "cache.sqlite-journal").symlink_to(outside)
+
+    with pytest.raises(ConfigError) as exc_sym:
+        ResponseCache(cache_dir)
+    assert exc_sym.value.code == "insecure_permissions"
+    assert outside.read_text(encoding="utf-8") == "keep"
+
+    ro_parent = tmp_path / "ro_parent"
+    ro_parent.mkdir(mode=0o700)
+    os.chmod(ro_parent, 0o500)
+    try:
+        with pytest.raises(ConfigError) as exc_ro:
+            ResponseCache(ro_parent / "sub")
+        assert exc_ro.value.code == "insecure_permissions"
+    finally:
+        os.chmod(ro_parent, 0o700)
+
+
+def _seed_multipage_db(cache_dir: Path) -> Path:
+    with ResponseCache(cache_dir) as cache:
+        for i in range(40):
+            cache.set(f"key-{i}", {"idx": i, "blob": "x" * 512}, ttl_seconds=600.0)
+        cache._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return cache.db_path
+
+
+def test_cache_recovers_page2_init_post_init_corruption_and_corrupt_row_json(
+    tmp_path: Path,
+) -> None:
+    # 1. Page-2+ corruption with intact page-1 sqlite_master caught and reset at __init__
+    init_dir = tmp_path / "page2_init"
+    db_path = _seed_multipage_db(init_dir)
+    raw = bytearray(db_path.read_bytes())
+    assert len(raw) >= 8192
+    raw[4096:8192] = b"\xff" * 4096
+    db_path.write_bytes(bytes(raw))
+    os.chmod(db_path, 0o600)
+
+    with ResponseCache(init_dir) as recovered:
+        assert recovered.get("key-0") is None
+        assert recovered.stats()["entry_count"] == 0
+        recovered.set("fresh", {"ok": True}, ttl_seconds=60.0)
+        assert recovered.get("fresh") == {"ok": True}
+
+    # 2. Post-init corruption on an already-open ResponseCache auto-recovers on get/set/stats
+    live_dir = tmp_path / "page2_live"
+    with ResponseCache(live_dir) as live:
+        with ResponseCache(live_dir) as peer:
+            for i in range(40):
+                peer.set(f"key-{i}", {"idx": i, "blob": "x" * 512}, ttl_seconds=600.0)
+            peer._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        live_raw = bytearray(live.db_path.read_bytes())
+        assert len(live_raw) >= 8192
+        live_raw[4096:] = b"\x00" * (len(live_raw) - 4096)
+        live.db_path.write_bytes(bytes(live_raw))
+        assert live.get("key-0") is None
+        assert live.stats()["entry_count"] == 0
+        live.set("after_live_corrupt", {"ok": 2}, ttl_seconds=60.0)
+        assert live.get("after_live_corrupt") == {"ok": 2}
+
+    # 3. Corrupt JSON inside row payload / metadata returns None and evicts corrupt row
+    row_dir = tmp_path / "corrupt_json_row"
+    with ResponseCache(row_dir) as cache:
+        cache.set("bad-payload", {"ok": 1}, ttl_seconds=60.0)
+        cache.set("bad-meta", {"ok": 2}, ttl_seconds=60.0, metadata={"a": 1})
+        cache._conn.execute(
+            "UPDATE cache_entries SET payload = '{not-json' WHERE cache_key = 'bad-payload'"
+        )
+        cache._conn.execute(
+            "UPDATE cache_entries SET metadata_json = '{bad-meta' WHERE cache_key = 'bad-meta'"
+        )
+        assert cache.get("bad-payload") is None
+        assert cache.get("bad-meta") is None
+        assert cache.stats()["entry_count"] == 0

@@ -439,6 +439,41 @@ async def test_proactive_scope_and_upstream_error_mapping(tmp_path: Path) -> Non
         assert exc_fault_scope.value.remediation == "strava-mcp auth"
         assert refresh_attempts == 0
 
+    # 2b. 401 permission faults encoding scope in err["code"] ("missing:<scope>")
+    for missing_code, expected_scope in (
+        ("missing:activity:read_all", "activity:read_all"),
+        ("missing:read_all", "read_all"),
+    ):
+        cfg_code_scope = _make_config(tmp_path / f"code_{expected_scope}", scope="")
+
+        async def _code_401_handler(
+            _request: httpx.Request,
+            code_val: str = missing_code,
+        ) -> httpx.Response:
+            return httpx.Response(
+                401,
+                headers=_rate_headers(),
+                json={
+                    "message": "Authorization Error",
+                    "errors": [
+                        {
+                            "resource": "Athlete",
+                            "field": "permission",
+                            "code": code_val,
+                        }
+                    ],
+                },
+            )
+
+        async with StravaClient(
+            cfg_code_scope,
+            transport=httpx.MockTransport(_code_401_handler),
+        ) as client_code:
+            with pytest.raises(InsufficientScopeError) as exc_code_scope:
+                await client_code.get_route(7002)
+            assert exc_code_scope.value.required_scopes == [expected_scope]
+            assert exc_code_scope.value.remediation == "strava-mcp auth"
+
     # 3. 402, 403 (CloudFront HTML / subscription / tier),
     # 404 (standard vs manual streams), 5xx, ConnectError
     cfg_err = _make_config(tmp_path / "errors", access_token="SUPER_SECRET_TOKEN_XYZ")
@@ -518,3 +553,39 @@ async def test_proactive_scope_and_upstream_error_mapping(tmp_path: Path) -> Non
             await client_err.get_route(999)
         assert exc_conn.value.status_code == 502
         assert "SUPER_SECRET_TOKEN_XYZ" not in json.dumps(exc_conn.value.to_dict())
+
+
+async def test_client_scope_case_normalization_and_get_gear_traversal_guard(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_config(tmp_path, scope="")
+    seen_urls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        return httpx.Response(
+            401,
+            headers=_rate_headers(),
+            json={
+                "message": "Authorization Error",
+                "errors": [
+                    {
+                        "resource": "Athlete",
+                        "field": "Activity:Read_All_Permission",
+                        "code": "missing:activity:read_all",
+                    }
+                ],
+            },
+        )
+
+    async with StravaClient(cfg, transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(InsufficientScopeError) as exc_scope:
+            await client.list_activities()
+        assert exc_scope.value.required_scopes == ["activity:read_all"]
+
+        for bad_gear in ("../athlete", "b1/extra", "b1?x=1", "b1#frag", "b 1", ""):
+            with pytest.raises(ValueError):
+                await client.get_gear(bad_gear)
+
+    assert len(seen_urls) == 1
+    assert "/athlete/activities" in seen_urls[0]

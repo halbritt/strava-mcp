@@ -187,7 +187,7 @@ def normalize_activity_units(activity: Mapping[str, Any]) -> dict[str, Any]:
 
     elevation_gain_m = round(float(raw_elev), 1) if _is_real_number(raw_elev) else None
     elevation_gain_ft = (
-        round(float(raw_elev) * FEET_PER_METER, 1) if _is_real_number(raw_elev) else None
+        round(elevation_gain_m * FEET_PER_METER, 1) if elevation_gain_m is not None else None
     )
 
     if _is_real_number(raw_avg_speed):
@@ -305,7 +305,7 @@ def normalize_athlete(raw: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize Strava athlete profile with metric/imperial weight and gear summaries."""
     raw_weight = raw.get("weight")
     weight_kg = round(float(raw_weight), 1) if _is_real_number(raw_weight) else None
-    weight_lbs = round(float(raw_weight) * KG_TO_LBS, 1) if _is_real_number(raw_weight) else None
+    weight_lbs = round(weight_kg * KG_TO_LBS, 1) if weight_kg is not None else None
 
     raw_bikes = raw.get("bikes")
     bikes = (
@@ -343,6 +343,7 @@ def normalize_athlete(raw: Mapping[str, Any]) -> dict[str, Any]:
         "summit": raw.get("summit"),
         "measurement_preference": raw.get("measurement_preference"),
         "ftp": raw.get("ftp"),
+        "weight": weight_kg,
         "weight_kg": weight_kg,
         "weight_lbs": weight_lbs,
         "created_at": raw.get("created_at"),
@@ -368,12 +369,16 @@ def _normalize_stat_totals(bucket: Any) -> dict[str, Any] | None:
 
     return {
         "count": bucket.get("count"),
+        "distance": distance_m,
         "distance_m": distance_m,
         "distance_km": round(distance_m / METERS_PER_KM, 2) if distance_m is not None else None,
         "distance_mi": round(distance_m / METERS_PER_MILE, 2) if distance_m is not None else None,
+        "moving_time": moving_s,
         "moving_time_seconds": moving_s,
         "moving_time_formatted": format_duration(moving_s),
+        "elapsed_time": elapsed_s,
         "elapsed_time_seconds": elapsed_s,
+        "elevation_gain": elev_m,
         "elevation_gain_m": elev_m,
         "elevation_gain_ft": round(elev_m * FEET_PER_METER, 1) if elev_m is not None else None,
         "achievement_count": bucket.get("achievement_count"),
@@ -427,6 +432,10 @@ def normalize_lap(raw: Mapping[str, Any]) -> dict[str, Any]:
         "start_date_local": raw.get("start_date_local"),
         "start_index": raw.get("start_index"),
         "end_index": raw.get("end_index"),
+        "distance": units["distance_m"],
+        "moving_time": units["moving_time_seconds"],
+        "elapsed_time": units["elapsed_time_seconds"],
+        "total_elevation_gain": units["elevation_gain_m"],
         **units,
         "average_heartrate": raw.get("average_heartrate"),
         "max_heartrate": raw.get("max_heartrate"),
@@ -483,6 +492,7 @@ def normalize_segment(raw: Mapping[str, Any]) -> dict[str, Any]:
         "id": raw.get("id"),
         "name": raw.get("name"),
         "activity_type": raw.get("activity_type"),
+        "distance": distance_m,
         "distance_m": distance_m,
         "distance_km": round(distance_m / METERS_PER_KM, 2) if distance_m is not None else None,
         "distance_mi": round(distance_m / METERS_PER_MILE, 2) if distance_m is not None else None,
@@ -490,6 +500,7 @@ def normalize_segment(raw: Mapping[str, Any]) -> dict[str, Any]:
         "maximum_grade": raw.get("maximum_grade"),
         "elevation_high_m": round(float(raw_high), 1) if _is_real_number(raw_high) else None,
         "elevation_low_m": round(float(raw_low), 1) if _is_real_number(raw_low) else None,
+        "total_elevation_gain": elev_m,
         "total_elevation_gain_m": elev_m,
         "total_elevation_gain_ft": (
             round(elev_m * FEET_PER_METER, 1) if elev_m is not None else None
@@ -507,6 +518,7 @@ def normalize_segment(raw: Mapping[str, Any]) -> dict[str, Any]:
         "start_latlng": raw.get("start_latlng"),
         "end_latlng": raw.get("end_latlng"),
         "athlete_pr_effort": raw.get("athlete_pr_effort"),
+        "athlete_segment_stats": raw.get("athlete_segment_stats"),
     }
 
 
@@ -848,6 +860,7 @@ def _aggregate_bucket(items: list[Mapping[str, Any]]) -> dict[str, Any]:
         "distance_m": dist_m,
         "distance_km": round(dist_m / METERS_PER_KM, 2),
         "distance_mi": round(dist_m / METERS_PER_MILE, 2),
+        "elevation_gain": elev_m,
         "elevation_gain_m": elev_m,
         "elevation_gain_ft": round(elev_m * FEET_PER_METER, 1),
         "moving_time_seconds": total_moving_s,
@@ -989,9 +1002,7 @@ async def fetch_activities_paginated(
         has_more = len(batch) >= per_page
         return (matched, 1, has_more)
 
-    fetch_per_page = 200 if (sport_type is not None and sport_type.strip()) else min(
-        200, max(per_page, limit)
-    )
+    fetch_per_page = 200 if (sport_type is not None and sport_type.strip()) else per_page
     collected: list[dict[str, Any]] = []
     pages_fetched = 0
     exhausted_upstream = False

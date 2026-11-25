@@ -6,15 +6,88 @@ set -eu
 
 config_dir="${STRAVA_MCP_CONFIG_DIR:-$HOME/.config/strava-mcp}"
 token_file="${STRAVA_MCP_TOKEN_FILE:-$config_dir/mcp-token}"
+token_dir=$(dirname "$token_file")
+
+if [ -L "$token_dir" ]; then
+    echo "strava-mcp-headers: insecure permissions (expected 0700 directory, refusing symlink): $token_dir" >&2
+    exit 1
+fi
+if [ ! -d "$token_dir" ]; then
+    echo "strava-mcp-headers: missing token directory: $token_dir" >&2
+    exit 1
+fi
+dir_mode=$(stat -c '%03a' "$token_dir" 2>/dev/null || stat -f '%Lp' "$token_dir" 2>/dev/null || true)
+case "$dir_mode" in
+    [0-7]00) ;;
+    *)
+        echo "strava-mcp-headers: insecure permissions (expected 0600 token file in 0700 directory): $token_dir" >&2
+        exit 1
+        ;;
+esac
+
+if [ -L "$token_file" ]; then
+    echo "strava-mcp-headers: insecure permissions (expected 0600 regular file, refusing symlink): $token_file" >&2
+    exit 1
+fi
+if [ ! -e "$token_file" ]; then
+    echo "strava-mcp-headers: missing token file: $token_file" >&2
+    exit 1
+fi
+if [ ! -f "$token_file" ]; then
+    echo "strava-mcp-headers: insecure permissions (expected 0600 regular file): $token_file" >&2
+    exit 1
+fi
+file_mode=$(stat -c '%03a' "$token_file" 2>/dev/null || stat -f '%Lp' "$token_file" 2>/dev/null || true)
+case "$file_mode" in
+    [0-7]00) ;;
+    *)
+        echo "strava-mcp-headers: insecure permissions (expected 0600) on token file: $token_file" >&2
+        exit 1
+        ;;
+esac
 
 if [ ! -r "$token_file" ]; then
     echo "strava-mcp-headers: unreadable token file: $token_file" >&2
     exit 1
 fi
 
-token=$(tr -d '\r\n' < "$token_file")
+raw_bytes=$(wc -c < "$token_file")
+non_nul_bytes=$(LC_ALL=C tr -d '\000' < "$token_file" | wc -c)
+if [ "$raw_bytes" -ne "$non_nul_bytes" ]; then
+    echo "strava-mcp-headers: invalid NUL byte in token file: $token_file" >&2
+    exit 1
+fi
+
+token=$(cat "$token_file"; printf x)
+token=${token%x}
+
+sp=' '
+tab=$(printf '\t')
+cr=$(printf '\r')
+nl=$(printf '\nx')
+nl=${nl%x}
+
+while [ -n "$token" ]; do
+    case "$token" in
+        "$sp"*|"$tab"*|"$cr"*|"$nl"*) token=${token#?} ;;
+        *) break ;;
+    esac
+done
+while [ -n "$token" ]; do
+    case "$token" in
+        *"$sp"|*"$tab"|*"$cr"|*"$nl") token=${token%?} ;;
+        *) break ;;
+    esac
+done
+
 if [ -z "$token" ]; then
     echo "strava-mcp-headers: empty token file: $token_file" >&2
+    exit 1
+fi
+
+cleaned=$(printf '%s' "$token" | LC_ALL=C tr -d '[:cntrl:][:space:]"\\')
+if [ "$cleaned" != "$token" ]; then
+    echo "strava-mcp-headers: invalid characters in token file: $token_file" >&2
     exit 1
 fi
 

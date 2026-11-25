@@ -24,6 +24,7 @@ from strava_mcp.config import (
     UpstreamAPIError,
     load_config,
 )
+from strava_mcp.metrics import validate_gear_id
 from strava_mcp.rate_limit import RateLimitTracker
 
 ACTIVITY_STREAM_KEYS: tuple[str, ...] = (
@@ -118,21 +119,30 @@ def _extract_scope_error_info(
 
     for err in errors:
         field_raw = err.get("field")
-        if not isinstance(field_raw, str):
-            continue
-        field = field_raw.strip()
-        lowered = field.lower()
-        if lowered.endswith("_permission"):
-            is_scope = True
-            candidate = field[: -len("_permission")].strip()
-            if candidate and candidate not in inferred:
-                inferred.append(candidate)
-        elif lowered in _KNOWN_SCOPES:
-            is_scope = True
-            if lowered not in inferred:
-                inferred.append(lowered)
-        elif "permission" in lowered or "scope" in lowered:
-            is_scope = True
+        if isinstance(field_raw, str):
+            field = field_raw.strip()
+            lowered = field.lower()
+            if lowered.endswith("_permission"):
+                is_scope = True
+                candidate = lowered[: -len("_permission")].strip()
+                if candidate and candidate not in inferred:
+                    inferred.append(candidate)
+            elif lowered in _KNOWN_SCOPES:
+                is_scope = True
+                if lowered not in inferred:
+                    inferred.append(lowered)
+            elif "permission" in lowered or "scope" in lowered:
+                is_scope = True
+
+        code_raw = err.get("code")
+        if isinstance(code_raw, str):
+            code_val = code_raw.strip().lower()
+            if code_val.startswith("missing:"):
+                code_val = code_val[len("missing:") :].strip()
+            if code_val in _KNOWN_SCOPES:
+                is_scope = True
+                if code_val not in inferred:
+                    inferred.append(code_val)
 
     if not is_scope and message is not None:
         lower_msg = message.lower()
@@ -627,9 +637,7 @@ class StravaClient:
         refresh: bool = False,
     ) -> dict[str, Any]:
         """Get gear details for a bike or shoe (GET /gear/{id})."""
-        cleaned_id = gear_id.strip()
-        if not cleaned_id:
-            raise ValueError("gear_id must not be empty.")
+        cleaned_id = validate_gear_id(gear_id)
         return await self._request(
             f"/gear/{cleaned_id}",
             required_scopes=("read",),

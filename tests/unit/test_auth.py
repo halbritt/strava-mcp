@@ -845,3 +845,59 @@ async def test_loopback_server_resists_stalled_tcp_client_and_closes_promptly(
 
     captured = capsys.readouterr()
     assert captured.err == ""
+
+
+async def test_acquire_file_lock_ro_dir_and_malformed_oauth_numbers(tmp_path: Path) -> None:
+    ro_cfg = tmp_path / "ro_cfg"
+    ro_cfg.mkdir(mode=0o700)
+    os.chmod(ro_cfg, 0o500)
+    try:
+        with pytest.raises(ConfigError) as exc_lock:
+            async with _acquire_file_lock(ro_cfg / "tokens.lock"):
+                pass
+        assert exc_lock.value.code == "insecure_permissions"
+    finally:
+        os.chmod(ro_cfg, 0o700)
+
+    cfg_dir = _seed_auth_dir(tmp_path / "cfg_num", expires_at=100)
+    bad_bodies = [
+        json.dumps(
+            {
+                "access_token": "acc-1",
+                "refresh_token": "ref-1",
+                "expires_at": 2_000_000_000,
+                "athlete": {"id": "not-an-int"},
+            }
+        ),
+        json.dumps(
+            {
+                "access_token": "acc-1",
+                "refresh_token": "ref-1",
+                "expires_at": 2_000_000_000,
+                "athlete": {"id": True},
+            }
+        ),
+        '{"access_token":"acc-1","refresh_token":"ref-1","expires_at":1e400}',
+        '{"access_token":"acc-1","refresh_token":"ref-1","expires_in":1e400}',
+    ]
+    for raw_json in bad_bodies:
+        async def _bad_handler(_req: httpx.Request, body_txt: str = raw_json) -> httpx.Response:
+            return httpx.Response(200, content=body_txt.encode("utf-8"))
+
+        tm = TokenManager(
+            cfg_dir,
+            oauth_base_url="https://mock.strava.test/oauth",
+            transport=httpx.MockTransport(_bad_handler),
+        )
+        with pytest.raises(AuthError) as exc_auth:
+            await tm.get_valid_tokens(force=True)
+        assert exc_auth.value.code == "refresh_failed"
+
+    tm_direct = TokenManager(cfg_dir)
+    for bad_direct in (
+        {"access_token": "acc-1", "refresh_token": "ref-1", "expires_at": float("nan")},
+        {"access_token": "acc-1", "refresh_token": "ref-1", "expires_in": float("inf")},
+    ):
+        with pytest.raises(AuthError) as exc_dir:
+            tm_direct._build_token_data(bad_direct)
+        assert exc_dir.value.code == "refresh_failed"
