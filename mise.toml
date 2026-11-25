@@ -1,0 +1,12 @@
+[tasks.test]
+description = "Run unit test suite"
+run = '''sh -eu -c '
+if mise tasks info host:exec >/dev/null 2>&1; then
+  exec mise run host:exec -- --timeout 5m --weight 1 -- uv run pytest tests/unit "$@" </dev/null
+fi
+exec uv run pytest tests/unit "$@" </dev/null
+' sh'''
+
+[tasks.lint]
+description = "Run ruff and pyright checks"
+run = "uv run ruff check src tests/unit && uv run pyright"
